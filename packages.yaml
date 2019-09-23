@@ -1,0 +1,16 @@
+---
+image: pvstodghill/comet
+version: 2019010__2019-08-28
+commands:
+  - comet.exe
+
+---
+image: pvstodghill/percolator
+version: 3.3__2019-08-29
+commands:
+  - elude
+  - msgf2pin
+  - percolator
+  - qvality
+  - sqt2pin
+  - tandem2pin

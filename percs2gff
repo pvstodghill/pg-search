@@ -1,0 +1,816 @@
+#! /usr/bin/env perl
+
+# ------------------------------------------------------------------------
+# perc2gff
+#
+# - Read a set of `percolator` `peptides.txt` files, one for each
+#   sample.
+# - assign color grades. explanation of color grades can be found in
+#   usage().
+# ------------------------------------------------------------------------
+
+use strict;
+use warnings FATAL => 'all';
+use Carp::Always;
+
+# use FindBin;
+# use lib "$FindBin::Bin";
+# use Xyzzy;
+
+use constant { TRUE => 1, FALSE => 0 };
+
+use constant { NO_VALUE => ";no-value;" };
+
+use constant {
+	      JUNK_VALUE => 0,
+	      COAL_VALUE => 1,
+	      BRONZE_VALUE => 2,
+	      SILVER_VALUE => 3,
+	      GOLD_VALUE => 4
+	     };
+use constant {
+	      COLOUR_JUNK => "255 255 255",   #FFFFFF
+	      COLOUR_COAL => "0 0 0",	      #000000
+	      COLOUR_BRONZE => "205 127 50",  #CD7F32
+	      COLOUR_SILVER => "192 192 192", #C0C0C0
+	      COLOUR_GOLD => "255 215 0"      #FFD700
+	     };
+
+sub min {
+  my ($x,$y) = @_;
+  if ( !defined($x) ) {
+    return $y;
+  } elsif ( !defined($y) ) {
+    return $x;
+  } elsif ( $x < $y ) {
+    return $x;
+  } else {
+    return $y;
+  }
+}
+
+sub max {
+  my ($x,$y) = @_;
+  if ( !defined($x) ) {
+    return $y;
+  } elsif ( !defined($y) ) {
+    return $x;
+  } elsif ( $x > $y ) {
+    return $x;
+  } else {
+    return $y;
+  }
+}
+
+# ------------------------------------------------------------------------
+# Process the command line
+# ------------------------------------------------------------------------
+
+use File::Basename;
+use Getopt::Std;
+
+our $opt_S;		      # random seed, for -m 2
+our $opt_e = 1;		      # cutoff for allowable errors for gold
+our $opt_f = 0.01;	      # FDR cutoff for bronze
+our $opt_h;		      # print help
+our $opt_m = 1;		      # method for resolving mapping ambiguity
+our $opt_o;		      # gff output file
+our $opt_r;		      # file to catch report
+our $opt_g = 2;		      # number of sample needed for gold
+my $opt_s = 2;	# num peptides to support ORF
+
+my $progname = basename($0);
+
+sub usage {
+  print STDERR "Usage: $progname [options] proteome.faa proteome.gff sample1.peptides.txt[.gz] ...\n";
+
+
+  print STDERR "-S N - random seed, for -m 2\n";
+  print STDERR "-e FD_CUTOFF [$opt_e]\n";
+  print STDERR "-f FDR_CUTOFF [$opt_f]\n";
+  print STDERR "-h - print help\n";
+  print STDERR "-m 1 - Only report peptides with unique genomic mappings (default)\n";
+  print STDERR "-m 2 - Report one random genomic mapping per peptide\n";
+  print STDERR "-m 3 - Report all genomic mapping\n";
+  print STDERR "-o FILENAME.gff - GFF output file [stdout]\n";
+  print STDERR "-r FILENAME.txt - Report output file\n";
+  print STDERR "-g SAMPLES_CUTOFF [$opt_g]\n";
+
+  print STDERR "\n";
+  print STDERR "two types of peptides reported:\n";
+  print STDERR "- complex: with any modifications\n";
+  print STDERR "- plain: all modifications removed\n";
+  print STDERR "\n";
+  print STDERR "peptide grades:\n";
+  print STDERR "- bronze: at least 1 sample has a q-value <= FDR_CUTOFF.\n";
+  print STDERR "- silver: at least 1 sample has \"FD score\" < FD_CUTOFF.\n";
+  print STDERR "- gold: silver in least SAMPLES_CUTOFF samples.\n";
+  print STDERR "\n";
+  print STDERR "ORF grades:\n";
+  print STDERR "- coal: at least one peptides\n";
+  print STDERR "- bronze: >= $opt_s bronze peptides\n";
+  print STDERR "- silver: >= $opt_s silver peptides\n";
+  print STDERR "- gold: >= $opt_s gold peptides\n";
+
+  exit(@_);
+}
+
+my $stat = getopts('S:e:f:g:hm:n:o:r:s:');
+if (!$stat) {
+  usage(1);
+}
+if ($opt_h) {
+  usage();
+}
+
+if ( $opt_m ne "1" && $opt_m ne "2" && $opt_m ne "3" ) {
+  usage(1);
+}
+
+my $proteome_faa = shift @ARGV;
+if (!defined($proteome_faa)) {
+  usage(1);
+}
+my $proteome_gff = shift @ARGV;
+if (!defined($proteome_gff)) {
+  usage(1);
+}
+
+my $num_samples = scalar(@ARGV);
+if ( $num_samples == 0 ) {
+  usage(1);
+}
+
+# ------------------------------------------------------------------------
+# Initialize
+# ------------------------------------------------------------------------
+
+my $report_fh;
+if ( $opt_r ) {
+  open($report_fh, ">", $opt_r) || die "Cannot open for writing: <<$opt_r>>,";
+}
+
+sub report {
+  print STDERR @_, "\n";
+  if ($report_fh) {
+    print $report_fh @_, "\n";
+  }
+}
+
+if (defined($opt_S)) {
+  srand($opt_S);
+}
+
+sub shuffle {
+  my @l = @_;
+  @l = map { [rand(),$_] } @l;
+  @l = sort { $a->[0] cmp $b->[0] } @l;
+  @l = map { $_->[1] } @l;
+  return @l;
+}
+
+
+# ------------------------------------------------------------------------
+# Read the peptides
+# ------------------------------------------------------------------------
+report("# Read the peptides");
+
+my @sample_peptides = ("ignore-me");
+my @raw_counts = ("ignore-me");
+
+sub my_open {
+  my ($filename) = @_;
+  my $fh;
+  if ( $filename =~ /\.gz$/ ) {
+    ( -f $filename ) || die "File does not exist: <<$filename>>,";
+    open($fh,"-|","gzip -cd $filename") || die;
+  } else {
+    open($fh,"<",$filename) || die;
+  }
+  return $fh;
+}
+
+for (my $i=1; $i<=$num_samples; $i++) {
+  my $peptide_file_i = $ARGV[$i-1];
+  report("## sample $i - reading $peptide_file_i");
+  my @lst;
+  push @raw_counts, 0;
+  my $fh = my_open($peptide_file_i);
+  while (<$fh>) {
+    chomp;
+    my ($PSMId,$score,$qvalue,$pep,$complex_peptide,$proteinIds) =
+      split(/\t/);
+    if ($PSMId eq "PSMId") {
+      next;
+    }
+    $raw_counts[$i]++;
+    if ( $opt_f < $qvalue ) {
+      next;
+    }
+    my $plain_peptide = $complex_peptide;
+    $plain_peptide =~ s/^[A-Z-]\.//;
+    $plain_peptide =~ s/\.[A-Z-]$//;
+    $plain_peptide =~ s/^n//;
+    $plain_peptide =~ s/c$//;
+    # remove modifications
+    #$plain_peptide =~ s/[*#@]//g; # comet's old modification format
+    $plain_peptide =~ s/\[[0-9.]+\]//g; # comet's new modification format
+    my $h = {
+	     score => $score,
+	     qvalue => $qvalue,
+	     pep => $pep,
+	     complex_peptide => $complex_peptide,
+	     plain_peptide => $plain_peptide,
+	     proteinIds => $proteinIds,
+	     grade => BRONZE_VALUE,
+	    };
+    push @lst, $h;
+  }
+  close $fh;
+  $sample_peptides[$i] = [@lst];
+}
+
+for (my $i=1; $i<=$num_samples; $i++) {
+  my $count = $raw_counts[$i];
+  report("## sample $i - $count complex peptides");
+}
+
+for (my $i=1; $i<=$num_samples; $i++) {
+  my $count = scalar(@{$sample_peptides[$i]});
+  report("## sample $i - $count bronze complex peptides");
+}
+
+# ------------------------------------------------------------------------
+# Compute FD scores
+# ------------------------------------------------------------------------
+report("# Compute FD scores");
+
+for (my $i=1; $i<=$num_samples; $i++) {
+  # Bin the PSM's by FDR value
+  my %bins;
+  foreach my $h ( @{$sample_peptides[$i]} ) {
+    my $fdr = $h->{qvalue};
+    my $a = $bins{$fdr};
+    if (!defined($a)) {
+      $a = $bins{$fdr} = [];
+    }
+    push @$a, $h;
+  }
+  # Compute FD for each peptide
+  my $silver_count = 0;
+  my $good_fdr = 0;
+  my $after_count = 0;
+  foreach my $fdr ( sort {$a<=>$b} (keys %bins) ) {
+    my $r = $bins{$fdr};
+    $after_count += scalar(@$r);
+    my $fd = $fdr * $after_count;
+    if ( $fd >= $opt_e ) {
+      last;
+    }
+    $good_fdr = $fdr;
+    $silver_count += scalar(@$r);
+    foreach my $h ( @$r ) {
+      $h->{grade} = SILVER_VALUE;
+    }
+  }
+  report("## sample $i - $silver_count silver complex peptides (FDR<=$good_fdr)");
+
+}
+
+# ------------------------------------------------------------------------
+# Collapse samples to single set
+# ------------------------------------------------------------------------
+report("# Collapse samples to single set");
+
+my %complex_peptides;
+
+for (my $i=1; $i<=$num_samples; $i++) {
+  foreach my $h ( @{$sample_peptides[$i]} ) {
+    my $complex_peptide = $h->{complex_peptide};
+    my $h2 = $complex_peptides{$complex_peptide};
+    if (!defined($h2)) {
+      $h2 = {
+	     plain_peptide => $h->{plain_peptide},
+	     complex_peptide => $complex_peptide,
+	     proteinIds => $h->{proteinIds},
+	     num_silver => ($h->{grade} == SILVER_VALUE) ? 1 : 0,
+	     score => $h->{score},
+	     qvalue => $h->{qvalue},
+	     pep => $h->{pep},
+	     samples => { $i => TRUE },
+	     };
+      $complex_peptides{$complex_peptide} = $h2;
+    } else {
+      ($h2->{plain_peptide} eq $h->{plain_peptide}) || die;
+      ($h2->{complex_peptide} eq $h->{complex_peptide}) || die;
+      $h2->{num_silver} += ($h->{grade} == SILVER_VALUE) ? 1 : 0;
+      $h2->{score} = max($h2->{score},$h->{score});
+      $h2->{qvalue} = min($h2->{qvalue},$h->{qvalue});
+      $h2->{pep} = min($h2->{pep},$h->{pep});
+      $h2->{samples}->{$i} = TRUE;
+    }
+  }
+}
+
+@sample_peptides = ();
+
+my $bronze_complex_count = 0;
+my $silver_complex_count = 0;
+my $gold_complex_count = 0;
+foreach my $h ( values(%complex_peptides) ) {
+  if ($h->{num_silver} >= $opt_g) {
+    $h->{grade} = GOLD_VALUE;
+    $gold_complex_count++;
+  } elsif ($h->{num_silver} >= 1) {
+    $h->{grade} = SILVER_VALUE;
+    $silver_complex_count++;
+  } else {
+    $h->{grade} = BRONZE_VALUE;
+    $bronze_complex_count++;
+  }
+}
+
+sub format_percent {
+  my ($n,$total) = @_;
+  return sprintf("%d (%.2f%%)", $n, ((100 * $n) / $total));
+}
+
+my $total_complex_count = scalar(keys(%complex_peptides));
+($total_complex_count == $bronze_complex_count + $silver_complex_count + $gold_complex_count) || die;
+report("## bronze complex peptides: ", format_percent($bronze_complex_count,$total_complex_count));
+report("## silver complex peptides: ", format_percent($silver_complex_count,$total_complex_count));
+report("## gold complex peptides: ", format_percent($gold_complex_count,$total_complex_count));
+
+
+# ------------------------------------------------------------------------
+# Compute plain peptides
+# ------------------------------------------------------------------------
+report("# Compute plain peptides");
+
+my %plain_peptides;
+
+foreach my $h2 ( values(%complex_peptides) ) {
+  my $plain_peptide = $h2->{plain_peptide};
+  my $h = $plain_peptides{$plain_peptide};
+  if (!defined($h)) {
+    $h = {
+	  plain_peptide => $plain_peptide,
+	  complex_peptides => [],
+	  # for mapping sanity check
+	  proteinIds => $h2->{proteinIds},
+	  score => $h2->{score},
+	  qvalue => $h2->{qvalue},
+	  pep => $h2->{pep},
+	  samples => {},
+	  grade => $h2->{grade},
+	 };
+    $plain_peptides{$plain_peptide} = $h;
+  }
+
+  $h->{score} = max($h->{score},$h2->{score});
+  $h->{qvalue} = min($h->{qvalue},$h2->{qvalue});
+  $h->{pep} = min($h->{pep},$h2->{pep});
+  $h->{grade} = max($h->{grade},$h2->{grade});
+
+  foreach my $i (keys(%{$h2->{samples}})) {
+    $h->{samples}->{$i} = TRUE;
+  }
+
+  push @{$h->{complex_peptides}}, $h2;
+}
+
+my $bronze_plain_count = 0;
+my $silver_plain_count = 0;
+my $gold_plain_count = 0;
+foreach my $h ( values(%plain_peptides) ) {
+  if ($h->{grade} == GOLD_VALUE) {
+    $gold_plain_count++;
+  } elsif ($h->{grade} == SILVER_VALUE) {
+    $silver_plain_count++;
+  } elsif ($h->{grade} == BRONZE_VALUE) {
+    $bronze_plain_count++;
+  } else {
+    die;
+  }
+}
+
+my $total_plain_count = scalar(keys(%plain_peptides));
+($total_plain_count == $bronze_plain_count + $silver_plain_count + $gold_plain_count) || die;
+report("## bronze plain peptides: ", format_percent($bronze_plain_count,$total_plain_count));
+report("## silver plain peptides: ", format_percent($silver_plain_count,$total_plain_count));
+report("## gold plain peptides: ", format_percent($gold_plain_count,$total_plain_count));
+
+# ------------------------------------------------------------------------
+# Reading proteome sequences: $proteome_faa
+# ------------------------------------------------------------------------
+report("# Reading proteome sequences: $proteome_faa");
+
+my $min_subseq_len;
+
+my %sequence_of;
+my %buckets;
+
+sub init_buckets {
+  my ($n) = @_;
+  if (!defined($n)) {
+    $n = 5;
+  }
+  $min_subseq_len = $n;
+}
+
+sub add_sequence {
+  my ($id,$seq) = @_;
+  $sequence_of{$id} = $seq;
+  for (my $i = 0; $i+$min_subseq_len <= length($seq); $i++) {
+    my $s = substr($seq,$i,$min_subseq_len);
+    my $a = $buckets{$s};
+    if (!defined($a)) {
+      $buckets{$s} = $a = [];
+    }
+    push @{$a}, [$id,$i];
+  }
+}
+
+sub search_sequences {
+  my ($subseq) = @_;
+  my @results;
+  (length($subseq) >= $min_subseq_len) || die "hash size too big,";
+  my $s = substr($subseq,0,$min_subseq_len);
+  my $a = $buckets{$s};
+  if (!defined($a)) {
+    return ();
+  }
+  foreach my $e ( @$a) {
+    my ($id,$offset) = @{$e};
+    my $sequence = $sequence_of{$id};
+    if ($subseq eq substr($sequence,$offset,length($subseq))) {
+      push @results, [$id, $offset]
+    }
+  }
+  return @results;
+}
+
+my $faa_defline;
+my $faa_sequence;
+
+init_buckets();
+
+sub store_protein {
+  if ( !defined($faa_defline) ) {
+    return;
+  }
+
+  ($faa_defline =~ /^>([^ ]+) *(.*)/)
+    || die "faa_defline=<<$faa_defline>>,";
+  my ($faa_protein,$faa_metadata) = ($1,$2);
+  add_sequence($faa_protein, $faa_sequence);
+
+  $faa_defline = $faa_sequence = undef;
+}
+
+my $fh = my_open($proteome_faa);
+while (<$fh>) {
+  chomp;
+  if ($_ eq "") {
+    next;
+  }
+  if ($_ !~ /^>/) {
+    $faa_sequence .= $_;
+    next;
+  }
+  store_protein();
+  $faa_defline = $_;
+  $faa_sequence = "";
+}
+store_protein();
+close($fh);
+
+# ------------------------------------------------------------------------
+# Map the peptides back onto the proteome
+# ------------------------------------------------------------------------
+report("# Map the peptides back onto the proteome");
+
+
+my %orfs;
+
+my $mapped_count = 0;
+
+loop_peptide:
+foreach my $h (values %plain_peptides) {
+  my $plain_peptide = $h->{plain_peptide};
+
+  my @results = search_sequences($plain_peptide);
+  (scalar(@results) >= 1) || die "plain_peptide=<<$plain_peptide>>,";
+
+  # sanity checks
+  {
+    my $match_protein =  $h->{proteinIds};
+    my $found = FALSE;
+    foreach my $e ( @results ) {
+      my ($orf_name,$orf_offset) = @$e;
+      if ( $orf_name eq $match_protein ) {
+	$found = TRUE;
+      }
+    }
+    ( $found ) || die "match_protein=<<$match_protein>>,";
+  }
+
+  my $num_locations = scalar(@results);
+
+  my @reported;
+  if ( $opt_m == 1 ) {
+    if ( $num_locations > 1 ) {
+      next loop_peptide;
+    }
+    @reported = @results;
+  } elsif ( $opt_m == 2 ) {
+    my @l = shuffle(@results);
+    @reported = ($l[0]);
+  } else {
+    ($opt_m == 3) || die;
+    @reported = @results;
+  }
+
+  foreach my $e ( @reported ) {
+    my ($orf_name,$orf_offset) = @$e;
+    delete $h->{proteinIds};
+    $h->{orf_name} = $orf_name;
+    $h->{orf_offset} = $orf_offset;
+
+    my $o = $orfs{$orf_name};
+    if ( !defined($o) ) {
+      $o = {
+	    name => $orf_name,
+	    plain_peptides => [],
+	   };
+      $orfs{$orf_name} = $o;
+    }
+    push @{$o->{plain_peptides}}, $h;
+  }
+
+  $mapped_count += scalar(@reported);
+}
+
+%sequence_of = ();
+%buckets = ();
+%plain_peptides = ();
+
+report("## mapped plain peptides: $mapped_count");
+
+my $coal_orfs = 0;
+my $bronze_orfs = 0;
+my $silver_orfs = 0;
+my $gold_orfs = 0;
+foreach my $orf_name ( keys %orfs ) {
+  my $o = $orfs{$orf_name};
+  my $num_bronze = 0;
+  my $num_silver = 0;
+  my $num_gold = 0;
+  foreach my $h ( @{$o->{plain_peptides}} ) {
+    if ($h->{grade} >= GOLD_VALUE) {
+      $num_gold++;
+    }
+    if ($h->{grade} >= SILVER_VALUE) {
+      $num_silver++;
+    }
+    $num_bronze++;
+  }
+
+  if ($num_gold >= $opt_s) {
+    $o->{grade} = GOLD_VALUE;
+    $gold_orfs++;
+  } elsif ($num_silver >= $opt_s) {
+    $o->{grade} = SILVER_VALUE;
+    $silver_orfs++;
+  } elsif ($num_bronze >= $opt_s) {
+    $o->{grade} = BRONZE_VALUE;
+    $bronze_orfs++;
+  } else {
+    $o->{grade} = COAL_VALUE;
+    $coal_orfs++;
+  }
+  
+}
+my $total_orfs = scalar(keys(%orfs));
+($total_orfs == $coal_orfs + $bronze_orfs + $silver_orfs + $gold_orfs) || die;
+report("## coal orfs: ", format_percent($coal_orfs,$total_orfs));
+report("## bronze orfs: ", format_percent($bronze_orfs,$total_orfs));
+report("## silver orfs: ", format_percent($silver_orfs,$total_orfs));
+report("## gold orfs: ", format_percent($gold_orfs,$total_orfs));
+
+
+# ------------------------------------------------------------------------
+# Reading proteome gff ($proteome_gff), writing gff output
+# ------------------------------------------------------------------------
+report("# Reading proteome gff ($proteome_gff), writing gff output");
+
+sub parse_gff_attributes {
+  my ($raw_attributes) = @_;
+  my $attributes = {};
+  foreach my $key_val (split(/; */,$raw_attributes)) {
+    my ($key,$val);
+    if ( $key_val =~ /^([^=]+)=(.*)/ ) {
+      ($key,$val) = ($1,$2);
+    } else {
+      ($key,$val) = ($key_val, NO_VALUE);
+    }
+    $attributes->{$key} = $val;
+  }
+  return $attributes;
+}
+
+my %accession_length;
+
+sub unparse_gff_attributes {
+  my ($attributes) = @_;
+  my @l;
+  my @keys = (keys %$attributes);
+  # determinism output rocks.
+  @keys = sort @keys;
+  foreach my $key (@keys) {
+    my $val = $attributes->{$key};
+    if ( $val eq NO_VALUE ) {
+      push @l, $key;
+    } else {
+      push @l, $key."=".$val;
+    }
+  }
+  return join(";",@l);
+}
+
+sub unparse_gff_line {
+  my ($seqname,$source,$feature,$start,$end,$score,$strand,$frame,$attributes) = @_;
+  my $len = $accession_length{$seqname};
+  (defined($len)) || die "seqname=<<$seqname>>,";
+  ($start < $end) || die;
+  (1 <= $start) || die;
+  if ( $len < $start ) {
+    ($start,$end) = ($start-$len,$end-$len);
+  }
+  if ( $len < $end ) {
+    $attributes->{crosses_origin} = NO_VALUE;
+  }
+
+  return join("\t",$seqname,$source,$feature,
+	      $start,$end, $score,$strand,$frame,
+	      unparse_gff_attributes($attributes));
+}
+
+sub xlate_aa_coords {
+  my ($orf_start,$orf_end,$orf_strand,$peptide_offset,$peptide_length) = @_;
+
+  my $bp_offset = 3 * $peptide_offset;
+  my $bp_length = 3 * $peptide_length;
+
+  my ($peptide_start,$peptide_end,$peptide_strand);
+
+  if ( $orf_strand eq "+") {
+    my $base = $orf_start + $bp_offset;
+    ($peptide_start,$peptide_end,$peptide_strand) =
+      ( $base, $base+$bp_length-1, "+");
+  } elsif ( $orf_strand eq "-") {
+    my $base = $orf_end - $bp_offset;
+    ($peptide_start,$peptide_end,$peptide_strand) =
+      ( $base-$bp_length+1, $base, "-");
+  } else {
+    die "orf_strand=<<$orf_strand>>,";
+  }
+
+  return ($peptide_start,$peptide_end,$peptide_strand);
+}
+
+# ------------------------------------------------------------------------
+
+sub grade_of {
+  my ($h) = @_;
+  return "gold" if ($h->{grade} == GOLD_VALUE);
+  return "silver" if ($h->{grade} == SILVER_VALUE);
+  return "bronze" if ($h->{grade} == BRONZE_VALUE);
+  return "coal" if ($h->{grade} == COAL_VALUE);
+  die;
+}
+
+sub colour_of {
+  my ($h) = @_;
+  return COLOUR_GOLD if ($h->{grade} == GOLD_VALUE);
+  return COLOUR_SILVER if ($h->{grade} == SILVER_VALUE);
+  return COLOUR_BRONZE if ($h->{grade} == BRONZE_VALUE);
+  return COLOUR_COAL if ($h->{grade} == COAL_VALUE);
+  die;
+}
+
+# ------------------------------------------------------------------------
+
+my $in_fh = my_open($proteome_gff);
+my $out_fh;
+if ( !defined($opt_o) || $opt_o eq "-" ) {
+  $out_fh = \*STDOUT;
+} else {
+  open($out_fh,">",$opt_o) || die "Cannot open for writing: <<$opt_o>>,";
+}
+print $out_fh "##gff-version 3\n";
+while (<$in_fh>) {
+
+  # Read the next orf
+  chomp;
+  if (/^#/) {
+    if (/^##gff-version /) {
+      next;
+    } elsif (/^##sequence-region ([^ ]+) 1 ([0-9]+)$/) {
+      $accession_length{$1} = $2;
+      next;
+    } else {
+      die "_=<<$_>>,";
+    }
+  }
+  my ($orf_seqname,$orf_source,$orf_feature,$orf_start,$orf_end,
+      $orf_score,$orf_strand,$orf_frame,$raw_orf_attributes) = split(/\t/,$_);
+  $orf_feature = "ORF";
+  my $orf_attributes = parse_gff_attributes($raw_orf_attributes);
+  delete $orf_attributes->{cross};
+  my $orf_name = $orf_attributes->{name};
+  my $o = $orfs{$orf_name};
+  if ( !defined($o) ) {
+    next;
+  }
+
+  # print the orf
+  my @plain_peptides = @{$o->{plain_peptides}};
+  # determinism output rocks.
+  @plain_peptides = sort { $a->{plain_peptide} cmp $b->{plain_peptide} } @plain_peptides;
+  $orf_attributes->{grade} = grade_of($o);
+  $orf_attributes->{colour} = colour_of($o);
+  $orf_attributes->{num_peptides} = scalar(@plain_peptides);
+  $orf_score = ".";
+  print $out_fh unparse_gff_line($orf_seqname,$orf_source,$orf_feature,
+				 $orf_start,$orf_end,
+				 $orf_score,$orf_strand,$orf_frame,
+				 $orf_attributes),"\n";
+
+  # print the supporting peptides
+  foreach my $h ( @plain_peptides ) {
+    my $plain_source = $progname;
+    my $plain_feature = "plain_peptide";
+    ($h->{orf_name} eq $orf_name) || die;
+    my $plain_offset = $h->{orf_offset};
+    my $plain_length = length($h->{plain_peptide});
+    my ($plain_start,$plain_end,$plain_strand) =
+      xlate_aa_coords($orf_start,$orf_end,$orf_strand,
+		      $plain_offset,$plain_length);
+    my $plain_score = $h->{score};
+    my @variants = @{$h->{complex_peptides}};
+    # determinism output rocks.
+    @variants = sort { $a->{complex_peptide} cmp $b->{complex_peptide} } @variants;
+    my $plain_attributes = {
+			    orf_name => $orf_name,
+			    variants => scalar(@variants),
+			    score => $h->{score},
+			    qvalue => $h->{qvalue},
+			    pep => $h->{pep},
+			    peptide => '"'.($h->{plain_peptide}).'"',
+			    grade => grade_of($h),
+			    num_samples => scalar(keys(%{$h->{samples}})),
+			    colour => colour_of($h),
+			   };
+    print $out_fh unparse_gff_line($orf_seqname,$plain_source,$plain_feature,
+				   $plain_start,$plain_end,
+				   $plain_score,$plain_strand,$orf_frame,
+				   $plain_attributes),"\n";
+
+    my $complex_feature = "complex_peptide";
+    my $variant_i = 1;
+    foreach my $h2 ( @variants ) {
+      my $complex_score = $h2->{score};
+      my $complex_attributes = {
+				orf_name => $orf_name,
+				score => $h2->{score},
+				qvalue => $h2->{qvalue},
+				pep => $h2->{pep},
+				peptide => '"'.($h2->{complex_peptide}).'"',
+				num_samples => scalar(keys(%{$h2->{samples}})),
+				grade => grade_of($h2),
+				variant => $variant_i,
+				colour => colour_of($h2),
+			       };
+      print $out_fh unparse_gff_line($orf_seqname,$plain_source,$complex_feature,
+				     $plain_start,$plain_end,
+				     $complex_score,$plain_strand,$orf_frame,
+				     $complex_attributes),"\n";
+      $variant_i++;
+    }
+  }
+
+}
+
+if ( defined($opt_o) && $opt_o ne "-" ) {
+  close $out_fh;
+}
+
+# ------------------------------------------------------------------------
+# Done.
+# ------------------------------------------------------------------------
+report("# Done\n");
+
+if ($opt_r) {
+  close $report_fh;
+}
